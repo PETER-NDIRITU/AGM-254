@@ -1,0 +1,204 @@
+import pandas as pd
+import streamlit as st
+import ee
+import datetime
+import geopandas as gpd
+import geemap.foliumap as geemap
+from shapely.geometry import mapping
+import plotly.express as px
+
+# Initialize Earth Engine
+ee.Initialize()
+
+
+# Load and filter the necessary datasets
+def load_kenyan_counties():
+    return gpd.read_file(
+        "C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Final Year Project/Datasets/Shapefiles/Counties.shp")
+
+
+def filter_county_by_name(county, query):
+    return county[county['NAME'].str.contains(query, case=False)]
+
+
+def load_croplands():
+    return gpd.read_file(
+        "C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Final Year Project/Datasets/Shapefiles/kenya_croplands_2015.shp")
+
+
+def filter_cropland_by_county_and_type(croplands, selected_county, selected_cropland):
+    county_geometry = selected_county.geometry.iloc[0]
+    croplands_within_county = croplands[croplands.intersects(county_geometry)]
+    croplands_within_county_and_type = croplands_within_county[
+        croplands_within_county['Main_Crop'] == selected_cropland]
+
+    if croplands_within_county_and_type.empty:
+        st.sidebar.warning(f"No {selected_cropland} croplands found within the selected county.")
+        return None
+
+    # Clip the croplands to the county geometry
+    croplands_within_county_and_type['geometry'] = croplands_within_county_and_type['geometry'].intersection(
+        county_geometry)
+    return croplands_within_county_and_type
+
+
+def create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_image=None):
+    county_data = county[county['NAME'] == OriginCounty]
+    selected_county_geometry = county_data.geometry.iloc[0]
+
+    # Check if croplands data is empty
+    if croplands_within_county_and_type is None:
+        return None
+
+    # Create geemap map
+    m = geemap.Map(center=[selected_county_geometry.centroid.y, selected_county_geometry.centroid.x], zoom=10)
+
+    # Add county boundary to the map
+    m.add_gdf(county_data, layer_name='County Boundary')
+
+    # Add croplands to the map
+    m.add_gdf(croplands_within_county_and_type, layer_name='Croplands')
+
+    # Add the NDVI image to the map
+    if ndvi_image:
+        m.addLayer(ndvi_image, {'min': -1, 'max': 1, 'palette': ['red', 'orange', 'yellow', 'green']}, 'NDVI')
+    return m
+
+
+# Define a function to calculate NDVI
+def calculate_ndvi(image):
+    ndvi = image.select('NDVI')
+    return ndvi
+
+
+# Convert a GeoPandas GeoDataFrame to an Earth Engine FeatureCollection
+def geodf_to_ee_featurecollection(geodf):
+    features = []
+    for _, row in geodf.iterrows():
+        geom = ee.Geometry(mapping(row['geometry']))
+        feature = ee.Feature(geom)
+        features.append(feature)
+    return ee.FeatureCollection(features)
+
+
+# Function to calculate NDVI Time Series
+def calculate_ndvi_timeseries(start_date, end_date, region):
+    ndvi_collection = ee.ImageCollection("MODIS/MOD09GA_006_NDVI").filterDate(start_date, end_date).select('NDVI')
+    ndvi_collection = ndvi_collection.map(lambda image: image.clip(region))
+
+    def add_date(image):
+        date = ee.Date(image.get('system:time_start'))
+        return image.set('date', date.format('YYYY-MM-dd'))
+
+    ndvi_collection = ndvi_collection.map(add_date)
+    ndvi_values = ndvi_collection.reduceRegions(
+        reducer=ee.Reducer.mean(),
+        collection=region,
+        scale=500
+    ).select(['date', 'mean'])
+
+    ndvi_dict = ndvi_values.getInfo()
+    dates = [item['properties']['date'] for item in ndvi_dict['features']]
+    values = [item['properties']['mean'] for item in ndvi_dict['features']]
+
+    return pd.DataFrame({'Date': dates, 'NDVI': values})
+
+
+def create_ndvi_chart(df):
+    fig = px.line(df, x='Date', y='NDVI', title='NDVI Time Series')
+    return fig
+
+
+# UI
+def main():
+    st.title("254 AgroMonitor")
+    # Load datasets
+    county = load_kenyan_counties()
+    croplands = load_croplands()
+
+    # Left sidebar for dataset selection
+    OriginCounty = st.sidebar.selectbox("Select County", county['NAME'].unique())
+    filtered_county = filter_county_by_name(county, OriginCounty)
+
+    # Filter crop types based on the selected county
+    county_geometry = filtered_county.geometry.iloc[0]
+    croplands_within_county = croplands[croplands.intersects(county_geometry)]
+    available_crops = croplands_within_county['Main_Crop'].unique()
+
+    CountyCropland = st.sidebar.selectbox("Select Crop Type", available_crops)
+    croplands_within_county_and_type = filter_cropland_by_county_and_type(croplands, filtered_county, CountyCropland)
+
+    ndvi_clipped = None
+    ndvi_df = pd.DataFrame()
+    # Dates Section
+    start_date = st.sidebar.date_input("Start Date")
+    end_date = st.sidebar.date_input("End Date")
+
+    if start_date >= end_date:
+        st.error("End Date must be after Start Date.")
+        return
+
+    # Place buttons in a single row
+    col1, col2 = st.sidebar.columns(2)
+
+    with col1:
+        calculate_ndvi_button = st.button("Calculate NDVI")
+    with col2:
+        generate_ndvi_ts_button = st.button("NDVI Chart")
+
+    if calculate_ndvi_button:
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+
+        # Perform NDVI calculation
+        ndvi_collection = ee.ImageCollection("MODIS/MOD09GA_006_NDVI").filterDate(start_date_str, end_date_str).select(
+            'NDVI')
+        ndvi_image = ndvi_collection.median()
+        ndvi = calculate_ndvi(ndvi_image)
+
+        # Convert croplands to Earth Engine FeatureCollection
+        croplands_ee = geodf_to_ee_featurecollection(croplands_within_county_and_type)
+
+        # Clip NDVI image to the croplands bounds
+        ndvi_clipped = ndvi.clip(croplands_ee)
+
+    if generate_ndvi_ts_button:
+        if ndvi_clipped:
+            ndvi_df = calculate_ndvi_timeseries(start_date_str, end_date_str, croplands_ee)
+            if not ndvi_df.empty:
+                st.plotly_chart(create_ndvi_chart(ndvi_df))
+            else:
+                st.sidebar.warning("No NDVI data available for the selected date range.")
+        else:
+            st.sidebar.warning("Please calculate NDVI first.")
+
+        # Place buttons in a single row
+    col3, col4 = st.sidebar.columns(2)
+
+    with col1:
+        calculate_SMI_button = st.button("Calculate SMI")
+    with col2:
+        generate_SMI_ts_button = st.button("SMI Chart")
+
+        # Place buttons in a single row
+    col5, col6 = st.sidebar.columns(2)
+
+    with col1:
+        calculate_Precipitation_button = st.button("Get Precipitation")
+    with col2:
+        generate_Precipitation_ts_button = st.button("Precipitation Chart")
+
+
+
+    # Create geemap map
+    geemap_map = create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_clipped)
+
+    if geemap_map is not None:
+        geemap_map.to_streamlit(height=550, width=850)
+
+    # Copyright
+    st.markdown("Copyright Peter Thuku 2024")
+
+
+if __name__ == "__main__":
+    main()
