@@ -37,12 +37,11 @@ def filter_cropland_by_county_and_type(croplands, selected_county, selected_crop
         return None
 
     # Clip the croplands to the county geometry
-    croplands_within_county_and_type['geometry'] = croplands_within_county_and_type['geometry'].intersection(
-        county_geometry)
+    croplands_within_county_and_type['geometry'] = croplands_within_county_and_type['geometry'].intersection(county_geometry)
     return croplands_within_county_and_type
 
 
-def create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_image=None):
+def create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_image=None, precipitation_image=None, sentinel_image=None):
     county_data = county[county['NAME'] == OriginCounty]
     selected_county_geometry = county_data.geometry.iloc[0]
 
@@ -59,16 +58,31 @@ def create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_i
     # Add croplands to the map
     m.add_gdf(croplands_within_county_and_type, layer_name='Croplands')
 
-    # Add the NDVI image to the map
+    # Add the images to the map
     if ndvi_image:
-        m.addLayer(ndvi_image, {'min': -1, 'max': 1, 'palette': ['red', 'orange', 'yellow', 'green']}, 'NDVI')
-    return m
+        m.addLayer(ndvi_image, {'min': -1, 'max': 1, 'palette': ['red', 'orange', 'green']}, 'NDVI')
 
+    if precipitation_image:
+        m.addLayer(precipitation_image, {'min':0, 'max':5, 'palette':['red', 'orange', 'green','blue']}, 'Precipitation')
+
+    if sentinel_image:
+        sentinel_vis_params = {'min': 0, 'max': 3000, 'bands': ['B4', 'B3', 'B2']}
+        m.addLayer(sentinel_image,sentinel_vis_params , 'RGB Sentinel')
+
+    return m
 
 # Define a function to calculate NDVI
 def calculate_ndvi(image):
     ndvi = image.select('NDVI')
     return ndvi
+
+def calculate_precipitation(image):
+    precipitation = image.select('precipitation')
+    return precipitation
+
+def calculate_RGB(image):
+    rgb = image.select('B4', 'B3', 'B2')
+    return  rgb
 
 
 # Convert a GeoPandas GeoDataFrame to an Earth Engine FeatureCollection
@@ -109,6 +123,8 @@ def create_ndvi_chart(df):
     return fig
 
 
+
+
 # UI
 def main():
     st.title("254 AgroMonitor")
@@ -129,7 +145,10 @@ def main():
     croplands_within_county_and_type = filter_cropland_by_county_and_type(croplands, filtered_county, CountyCropland)
 
     ndvi_clipped = None
+    precipitation_clipped = None
+    sentinel_clipped = None
     ndvi_df = pd.DataFrame()
+
     # Dates Section
     start_date = st.sidebar.date_input("Start Date")
     end_date = st.sidebar.date_input("End Date")
@@ -138,7 +157,27 @@ def main():
         st.error("End Date must be after Start Date.")
         return
 
-    # Place buttons in a single row
+    # Sentinel Imagery addition
+    col1, col2 = st.sidebar.columns(2)
+
+    with col1:
+        calculate_rgb_sentinel_button = st.button("Sentinel-2 MSI")
+    with col2:
+        calculate_rgb_landsat_button = st.button("Landsat 8 Imagery")
+
+    if calculate_rgb_sentinel_button:
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        # Perform Sentinel calculation
+        sentinel_collection = ee.ImageCollection("COPERNICUS/S2_HARMONIZED").filterDate(start_date_str, end_date_str).select('B4', 'B3', 'B2').filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+        sentinel_image = sentinel_collection.median()
+        sentinel = calculate_RGB(sentinel_image)
+        # Convert croplands to Earth Engine FeatureCollection
+        croplands_ee = geodf_to_ee_featurecollection(croplands_within_county_and_type)
+        # Clip Sentinel image to the croplands bounds
+        sentinel_clipped = sentinel.clip(croplands_ee)
+
+    # NDVI Initialization
     col1, col2 = st.sidebar.columns(2)
 
     with col1:
@@ -149,56 +188,56 @@ def main():
     if calculate_ndvi_button:
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
-
         # Perform NDVI calculation
-        ndvi_collection = ee.ImageCollection("MODIS/MOD09GA_006_NDVI").filterDate(start_date_str, end_date_str).select(
-            'NDVI')
+        ndvi_collection = ee.ImageCollection("MODIS/MOD09GA_006_NDVI").filterDate(start_date_str, end_date_str).select('NDVI')
         ndvi_image = ndvi_collection.median()
         ndvi = calculate_ndvi(ndvi_image)
-
         # Convert croplands to Earth Engine FeatureCollection
         croplands_ee = geodf_to_ee_featurecollection(croplands_within_county_and_type)
-
         # Clip NDVI image to the croplands bounds
         ndvi_clipped = ndvi.clip(croplands_ee)
 
     if generate_ndvi_ts_button:
         if ndvi_clipped:
+            start_date_str = start_date.strftime('%Y-%m-%d')
+            end_date_str = end_date.strftime('%Y-%m-%d')
             ndvi_df = calculate_ndvi_timeseries(start_date_str, end_date_str, croplands_ee)
             if not ndvi_df.empty:
-                st.plotly_chart(create_ndvi_chart(ndvi_df))
+                st.line_chart(create_ndvi_chart(ndvi_df))
             else:
                 st.sidebar.warning("No NDVI data available for the selected date range.")
         else:
             st.sidebar.warning("Please calculate NDVI first.")
 
-        # Place buttons in a single row
-    col3, col4 = st.sidebar.columns(2)
 
-    with col1:
-        calculate_SMI_button = st.button("Calculate SMI")
-    with col2:
-        generate_SMI_ts_button = st.button("SMI Chart")
-
-        # Place buttons in a single row
-    col5, col6 = st.sidebar.columns(2)
+    # Precipitation Initialization
+    col1, col2 = st.sidebar.columns(2)
 
     with col1:
         calculate_Precipitation_button = st.button("Get Precipitation")
     with col2:
         generate_Precipitation_ts_button = st.button("Precipitation Chart")
 
-
+    if calculate_Precipitation_button:
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        # Perform Precipitation calculation
+        precipitation_collection = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(start_date_str, end_date_str).select('precipitation')
+        precipitation_image = precipitation_collection.median()
+        precipitation = calculate_precipitation(precipitation_image)
+        # Convert croplands to Earth Engine FeatureCollection
+        croplands_ee = geodf_to_ee_featurecollection(croplands_within_county_and_type)
+        # Clip Precipitation image to the croplands bounds
+        precipitation_clipped = precipitation.clip(croplands_ee)
 
     # Create geemap map
-    geemap_map = create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_clipped)
+    geemap_map = create_geemap(OriginCounty, county, croplands_within_county_and_type, ndvi_clipped, precipitation_clipped, sentinel_clipped)
 
     if geemap_map is not None:
-        geemap_map.to_streamlit(height=550, width=850)
+        geemap_map.to_streamlit(height=610, width=900)
 
     # Copyright
-    st.markdown("Copyright Peter Thuku 2024")
-
+    st.markdown("&copy; Peter Thuku 2024")
 
 if __name__ == "__main__":
     main()
